@@ -58,7 +58,7 @@ pub(crate) fn setup_logging(level: Level, duration: impl Layer<Registry> + Send 
                     HierarchicalLayer::default()
                         .with_targets(true)
                         .with_timer(Uptime::default())
-                        .with_writer(std::io::stderr),
+                        .with_writer(anstream::stderr),
                 )
                 .init();
         }

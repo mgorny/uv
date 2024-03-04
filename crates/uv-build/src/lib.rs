@@ -450,22 +450,7 @@ impl SourceBuild {
             OsString::from(venv.scripts())
         };
 
-        if let Some(pep517_backend) = &pep517_backend {
-            create_pep517_build_environment(
-                &source_tree,
-                &venv,
-                pep517_backend,
-                build_context,
-                &package_id,
-                build_kind,
-                &config_settings,
-                &environment_variables,
-                &modified_path,
-            )
-            .await?;
-        }
-
-        Ok(Self {
+        let source_build = Self {
             temp_dir,
             source_tree,
             pep517_backend,
@@ -476,7 +461,106 @@ impl SourceBuild {
             package_id,
             environment_variables,
             modified_path,
-        })
+        };
+
+        if let Some(pep517_backend) = &source_build.pep517_backend {
+            source_build
+                .create_pep517_build_environment(pep517_backend, build_context)
+                .await?;
+        }
+
+        Ok(source_build)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_pep517_build_environment(
+        &self,
+        pep517_backend: &Pep517Backend,
+        build_context: &impl BuildContext,
+    ) -> Result<(), Error> {
+        debug!(
+            "Calling `{}.get_requires_for_build_{}()`",
+            pep517_backend.backend, self.build_kind
+        );
+        let script = formatdoc! {
+            r#"
+            {}
+            import json
+
+            get_requires_for_build = getattr(backend, "get_requires_for_build_{}", None)
+            if get_requires_for_build:
+                requires = get_requires_for_build(config_settings={})
+            else:
+                requires = []
+            print(json.dumps(requires))
+            "#, pep517_backend.backend_import(), self.build_kind, self.config_settings.escape_for_python()
+        };
+        let span = info_span!(
+            "run_python_script",
+            script=format!("get_requires_for_build_{}", self.build_kind),
+            python_version = %self.venv.interpreter().python_version()
+        );
+        let output = self
+            .run_python_script(&script, &format!("build_{}()", self.build_kind))
+            .instrument(span)
+            .await?;
+        if !output.status.success() {
+            return Err(Error::from_command_output(
+                format!(
+                    "Build backend failed to determine extra requires with `build_{}()`",
+                    self.build_kind
+                ),
+                &output,
+                &self.package_id,
+            ));
+        }
+        let extra_requires = output
+            .stdout
+            .lines()
+            .last()
+            .transpose()
+            .map_err(|err| err.to_string())
+            .and_then(|last_line| last_line.ok_or("Missing message".to_string()))
+            .and_then(|message| serde_json::from_str(&message).map_err(|err| err.to_string()));
+
+        let extra_requires: Vec<Requirement> = extra_requires.map_err(|err| {
+            Error::from_command_output(
+                format!(
+                    "Build backend failed to return extra requires with `get_requires_for_build_{}`: {err}", self.build_kind
+                ),
+                &output,
+                &self.package_id,
+            )
+        })?;
+
+        // Some packages (such as tqdm 4.66.1) list only extra requires that have already been part of
+        // the pyproject.toml requires (in this case, `wheel`). We can skip doing the whole resolution
+        // and installation again.
+        // TODO(konstin): Do we still need this when we have a fast resolver?
+        if extra_requires
+            .iter()
+            .any(|req| !pep517_backend.requirements.contains(req))
+        {
+            debug!("Installing extra requirements for build backend");
+            let requirements: Vec<Requirement> = pep517_backend
+                .requirements
+                .iter()
+                .cloned()
+                .chain(extra_requires)
+                .collect();
+            let resolution = build_context.resolve(&requirements).await.map_err(|err| {
+                Error::RequirementsInstall("build-system.requires (resolve)", err)
+            })?;
+
+            build_context
+                .install(&resolution, &self.venv)
+                .await
+                .map_err(|err| {
+                    Error::RequirementsInstall("build-system.requires (install)", err)
+                })?;
+        }
+
+        Ok(())
     }
 
     async fn get_resolved_requirements(
@@ -616,15 +700,10 @@ impl SourceBuild {
             script="prepare_metadata_for_build_wheel",
             python_version = %self.venv.interpreter().python_version()
         );
-        let output = run_python_script(
-            &self.venv,
-            &script,
-            &self.source_tree,
-            &self.environment_variables,
-            &self.modified_path,
-        )
-        .instrument(span)
-        .await?;
+        let output = self
+            .run_python_script(&script, "prepare_metadata_for_build_wheel")
+            .instrument(span)
+            .await?;
         if !output.status.success() {
             return Err(Error::from_command_output(
                 "Build backend failed to determine metadata through `prepare_metadata_for_build_wheel`".to_string(),
@@ -749,30 +828,16 @@ impl SourceBuild {
             metadata_directory,
             self.config_settings.escape_for_python()
         };
+        let build_hook = format!("build_{}", self.build_kind);
         let span = info_span!(
             "run_python_script",
-            script=format!("build_{}", self.build_kind),
+            script=&build_hook,
             python_version = %self.venv.interpreter().python_version()
         );
-        let output = run_python_script(
-            &self.venv,
-            &script,
-            &self.source_tree,
-            &self.environment_variables,
-            &self.modified_path,
-        )
-        .instrument(span)
-        .await?;
-        if !output.status.success() {
-            return Err(Error::from_command_output(
-                format!(
-                    "Build backend failed to build wheel through `build_{}()`",
-                    self.build_kind
-                ),
-                &output,
-                &self.package_id,
-            ));
-        }
+        let output = self
+            .run_python_script(&script, &build_hook)
+            .instrument(span)
+            .await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let distribution_filename = stdout.lines().last();
         let Some(distribution_filename) =
@@ -788,6 +853,41 @@ impl SourceBuild {
             ));
         };
         Ok(distribution_filename.to_string())
+    }
+
+    /// It is the caller's responsibility to create an informative span.
+    async fn run_python_script(&self, script: &str, build_hook: &str) -> Result<Output, Error> {
+        let output = Command::new(self.venv.python_executable())
+            .args(["-c", script])
+            .current_dir(self.source_tree.simplified())
+            // Pass in remaining environment variables
+            .envs(&self.environment_variables)
+            // Set the modified PATH
+            .env("PATH", &self.modified_path)
+            // Activate the venv
+            .env("VIRTUAL_ENV", self.venv.root())
+            .output()
+            .await
+            .map_err(|err| {
+                Error::CommandFailed(self.venv.python_executable().to_path_buf(), err)
+            })?;
+        if !output.status.success() {
+            return Err(Error::from_command_output(
+                format!(
+                    "Build backend failed to build wheel through `build_{}()`",
+                    self.build_kind
+                ),
+                &output,
+                &self.package_id,
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        debug!(
+            "Output `{}` for {}:\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}\n---",
+            build_hook, self.package_id
+        );
+        Ok(output)
     }
 }
 
@@ -805,127 +905,6 @@ fn escape_path_for_python(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-}
-
-/// Not a method because we call it before the builder is completely initialized
-#[allow(clippy::too_many_arguments)]
-async fn create_pep517_build_environment(
-    source_tree: &Path,
-    venv: &PythonEnvironment,
-    pep517_backend: &Pep517Backend,
-    build_context: &impl BuildContext,
-    package_id: &str,
-    build_kind: BuildKind,
-    config_settings: &ConfigSettings,
-    environment_variables: &FxHashMap<OsString, OsString>,
-    modified_path: &OsString,
-) -> Result<(), Error> {
-    debug!(
-        "Calling `{}.get_requires_for_build_{}()`",
-        pep517_backend.backend, build_kind
-    );
-    let script = formatdoc! {
-        r#"
-            {}
-            import json
-
-            get_requires_for_build = getattr(backend, "get_requires_for_build_{}", None)
-            if get_requires_for_build:
-                requires = get_requires_for_build(config_settings={})
-            else:
-                requires = []
-            print(json.dumps(requires))
-        "#, pep517_backend.backend_import(), build_kind, config_settings.escape_for_python()
-    };
-    let span = info_span!(
-        "run_python_script",
-        script=format!("get_requires_for_build_{}", build_kind),
-        python_version = %venv.interpreter().python_version()
-    );
-    let output = run_python_script(
-        venv,
-        &script,
-        source_tree,
-        environment_variables,
-        modified_path,
-    )
-    .instrument(span)
-    .await?;
-    if !output.status.success() {
-        return Err(Error::from_command_output(
-            format!("Build backend failed to determine extra requires with `build_{build_kind}()`"),
-            &output,
-            package_id,
-        ));
-    }
-    let extra_requires = output
-        .stdout
-        .lines()
-        .last()
-        .transpose()
-        .map_err(|err| err.to_string())
-        .and_then(|last_line| last_line.ok_or("Missing message".to_string()))
-        .and_then(|message| serde_json::from_str(&message).map_err(|err| err.to_string()));
-
-    let extra_requires: Vec<Requirement> = extra_requires.map_err(|err| {
-        Error::from_command_output(
-            format!(
-                "Build backend failed to return extra requires with `get_requires_for_build_{build_kind}`: {err}"
-            ),
-            &output,
-            package_id,
-        )
-    })?;
-
-    // Some packages (such as tqdm 4.66.1) list only extra requires that have already been part of
-    // the pyproject.toml requires (in this case, `wheel`). We can skip doing the whole resolution
-    // and installation again.
-    // TODO(konstin): Do we still need this when we have a fast resolver?
-    if extra_requires
-        .iter()
-        .any(|req| !pep517_backend.requirements.contains(req))
-    {
-        debug!("Installing extra requirements for build backend");
-        let requirements: Vec<Requirement> = pep517_backend
-            .requirements
-            .iter()
-            .cloned()
-            .chain(extra_requires)
-            .collect();
-        let resolution = build_context
-            .resolve(&requirements)
-            .await
-            .map_err(|err| Error::RequirementsInstall("build-system.requires (resolve)", err))?;
-
-        build_context
-            .install(&resolution, venv)
-            .await
-            .map_err(|err| Error::RequirementsInstall("build-system.requires (install)", err))?;
-    }
-
-    Ok(())
-}
-
-/// It is the caller's responsibility to create an informative span.
-async fn run_python_script(
-    venv: &PythonEnvironment,
-    script: &str,
-    source_tree: &Path,
-    environment_variables: &FxHashMap<OsString, OsString>,
-    modified_path: &OsString,
-) -> Result<Output, Error> {
-    Command::new(venv.python_executable())
-        .args(["-c", script])
-        .current_dir(source_tree.simplified())
-        // Pass in remaining environment variables
-        .envs(environment_variables)
-        // Set the modified PATH
-        .env("PATH", modified_path)
-        // Activate the venv
-        .env("VIRTUAL_ENV", venv.root())
-        .output()
-        .await
-        .map_err(|err| Error::CommandFailed(venv.python_executable().to_path_buf(), err))
 }
 
 #[cfg(test)]
