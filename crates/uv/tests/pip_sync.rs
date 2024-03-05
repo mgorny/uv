@@ -2993,3 +2993,51 @@ requires-python = "<=3.5"
 
     Ok(())
 }
+
+/// Raise an error when a direct URL dependency's `Requires-Python` constraint is not met.
+///
+/// TODO(charlie): This currently passes, but should fail.
+#[test]
+fn requires_python_direct_url() -> Result<()> {
+    let context = TestContext::new("3.12");
+
+    // Create an editable package with a `Requires-Python` constraint that is not met.
+    let editable_dir = assert_fs::TempDir::new()?;
+    let pyproject_toml = editable_dir.child("pyproject.toml");
+    pyproject_toml.write_str(
+        r#"[project]
+name = "example"
+version = "0.0.0"
+dependencies = [
+  "anyio==4.0.0"
+]
+requires-python = "<=3.5"
+"#,
+    )?;
+
+    // Write to a requirements file.
+    let requirements_in = context.temp_dir.child("requirements.in");
+    requirements_in.write_str(&format!("example @ {}", editable_dir.path().display()))?;
+
+    // In addition to the standard filters, remove the temporary directory from the snapshot.
+    let filters: Vec<_> = [(r"\(from file://.*\)", "(from file://[TEMP_DIR])")]
+        .into_iter()
+        .chain(INSTA_FILTERS.to_vec())
+        .collect();
+
+    uv_snapshot!(filters, command(&context)
+        .arg("requirements.in"), @r###"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Downloaded 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + example==0.0.0 (from file://[TEMP_DIR])
+    "###
+    );
+
+    Ok(())
+}
