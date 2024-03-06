@@ -121,6 +121,9 @@ enum Commands {
     Venv(VenvArgs),
     /// Manage the cache.
     Cache(CacheNamespace),
+    /// Manage the `uv` executable.
+    #[clap(name = "self", hide = true)]
+    Self_(SelfNamespace),
     /// Remove all items from the cache.
     #[clap(hide = true)]
     Clean(CleanArgs),
@@ -132,6 +135,18 @@ enum Commands {
     /// Generate shell completion
     #[clap(alias = "--generate-shell-completion", hide = true)]
     GenerateShellCompletion { shell: clap_complete_command::Shell },
+}
+
+#[derive(Args)]
+struct SelfNamespace {
+    #[clap(subcommand)]
+    command: SelfCommand,
+}
+
+#[derive(Subcommand)]
+enum SelfCommand {
+    /// Update `uv` to the latest version.
+    Update,
 }
 
 #[derive(Args)]
@@ -151,13 +166,6 @@ enum CacheCommand {
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct CleanArgs {
-    /// The packages to remove from the cache.
-    package: Vec<PackageName>,
-}
-
-#[derive(Args)]
-#[allow(clippy::struct_excessive_bools)]
-struct DirArgs {
     /// The packages to remove from the cache.
     package: Vec<PackageName>,
 }
@@ -1556,6 +1564,9 @@ async fn run() -> Result<ExitStatus> {
             )
             .await
         }
+        Commands::Self_(SelfNamespace {
+            command: SelfCommand::Update,
+        }) => commands::self_update(printer).await,
         Commands::Version { output_format } => {
             commands::version(output_format, &mut stdout())?;
             Ok(ExitStatus::Success)
