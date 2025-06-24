@@ -35,6 +35,7 @@ pub struct WheelFilename {
     pub name: PackageName,
     pub version: Version,
     tags: WheelTag,
+    variant_tag: Option<String>,
 }
 
 impl FromStr for WheelFilename {
@@ -71,6 +72,7 @@ impl WheelFilename {
         python_tag: LanguageTag,
         abi_tag: AbiTag,
         platform_tag: PlatformTag,
+        variant_tag: Option<String>,
     ) -> Self {
         Self {
             name,
@@ -82,6 +84,7 @@ impl WheelFilename {
                     platform_tag,
                 },
             },
+            variant_tag: variant_tag,
         }
     }
 
@@ -213,24 +216,60 @@ impl WheelFilename {
             ));
         };
 
-        let (name, version, build_tag, python_tag, abi_tag, platform_tag, is_small) =
-            if let Some(platform_tag) = splitter.next() {
-                if splitter.next().is_some() {
-                    return Err(WheelFilenameError::InvalidWheelFileName(
-                        filename.to_string(),
-                        "Must have 5 or 6 components, but has more".to_string(),
-                    ));
+        let (name, version, build_tag, python_tag, abi_tag, platform_tag, variant_tag, is_small) =
+            if let Some(platform_tag_or_variant_tag) = splitter.next() {
+                if let Some(variant_tag) = splitter.next() {
+                    if splitter.next().is_some() {
+                        return Err(WheelFilenameError::InvalidWheelFileName(
+                            filename.to_string(),
+                            "Must have 5 or 6 components, but has more".to_string(),
+                        ));
+                    }
+                    (
+                        &stem[..version],
+                        &stem[version + 1..build_tag_or_python_tag],
+                        Some(&stem[build_tag_or_python_tag + 1..python_tag_or_abi_tag]),
+                        &stem[python_tag_or_abi_tag + 1..abi_tag_or_platform_tag],
+                        &stem[abi_tag_or_platform_tag + 1..platform_tag_or_variant_tag],
+                        &stem[platform_tag_or_variant_tag + 1..variant_tag],
+                        Some(&stem[variant_tag + 1..]),
+                        // Always take the slow path if a build tag is present.
+                        false,
+                    )
+                } else {
+                    if stem
+                        .chars()
+                        .nth(build_tag_or_python_tag + 1)
+                        .unwrap()
+                        .is_ascii_digit()
+                    {
+                        (
+                            &stem[..version],
+                            &stem[version + 1..build_tag_or_python_tag],
+                            Some(&stem[build_tag_or_python_tag + 1..python_tag_or_abi_tag]),
+                            &stem[python_tag_or_abi_tag + 1..abi_tag_or_platform_tag],
+                            &stem[abi_tag_or_platform_tag + 1..platform_tag_or_variant_tag],
+                            &stem[platform_tag_or_variant_tag + 1..],
+                            None,
+                            // Always take the slow path if a build tag is present.
+                            false,
+                        )
+                    } else {
+                        (
+                            &stem[..version],
+                            &stem[version + 1..build_tag_or_python_tag],
+                            None,
+                            &stem[build_tag_or_python_tag + 1..python_tag_or_abi_tag],
+                            &stem[python_tag_or_abi_tag + 1..abi_tag_or_platform_tag],
+                            &stem[abi_tag_or_platform_tag + 1..platform_tag_or_variant_tag],
+                            Some(&stem[platform_tag_or_variant_tag + 1..]),
+                            // Determine whether any of the tag types contain a period, which would indicate
+                            // that at least one of the tag types includes multiple tags (which in turn
+                            // necessitates taking the slow path).
+                            memchr(b'.', &stem.as_bytes()[build_tag_or_python_tag..]).is_none(),
+                        )
+                    }
                 }
-                (
-                    &stem[..version],
-                    &stem[version + 1..build_tag_or_python_tag],
-                    Some(&stem[build_tag_or_python_tag + 1..python_tag_or_abi_tag]),
-                    &stem[python_tag_or_abi_tag + 1..abi_tag_or_platform_tag],
-                    &stem[abi_tag_or_platform_tag + 1..platform_tag],
-                    &stem[platform_tag + 1..],
-                    // Always take the slow path if a build tag is present.
-                    false,
-                )
             } else {
                 (
                     &stem[..version],
@@ -239,6 +278,7 @@ impl WheelFilename {
                     &stem[build_tag_or_python_tag + 1..python_tag_or_abi_tag],
                     &stem[python_tag_or_abi_tag + 1..abi_tag_or_platform_tag],
                     &stem[abi_tag_or_platform_tag + 1..],
+                    None,
                     // Determine whether any of the tag types contain a period, which would indicate
                     // that at least one of the tag types includes multiple tags (which in turn
                     // necessitates taking the slow path).
@@ -256,6 +296,7 @@ impl WheelFilename {
                     .map_err(|err| WheelFilenameError::InvalidBuildTag(filename.to_string(), err))
             })
             .transpose()?;
+        let variant_tag = variant_tag.map(|variant_tag| variant_tag.to_string());
 
         let tags = if let Some(small) = is_small
             .then(|| {
@@ -295,6 +336,7 @@ impl WheelFilename {
             name,
             version,
             tags,
+            variant_tag,
         })
     }
 }
@@ -400,8 +442,9 @@ mod tests {
     #[test]
     fn err_too_many_parts() {
         let err =
-            WheelFilename::from_str("foo-1.2.3-202206090410-py3-none-any-whoops.whl").unwrap_err();
-        insta::assert_snapshot!(err, @r###"The wheel filename "foo-1.2.3-202206090410-py3-none-any-whoops.whl" is invalid: Must have 5 or 6 components, but has more"###);
+            WheelFilename::from_str("foo-1.2.3-202206090410-py3-none-any-12345678-whoops.whl")
+                .unwrap_err();
+        insta::assert_snapshot!(err, @r###"The wheel filename "foo-1.2.3-202206090410-py3-none-any-12345678-whoops.whl" is invalid: Must have 5 or 6 components, but has more"###);
     }
 
     #[test]
@@ -418,8 +461,8 @@ mod tests {
 
     #[test]
     fn err_invalid_build_tag() {
-        let err = WheelFilename::from_str("foo-1.2.3-tag-py3-none-any.whl").unwrap_err();
-        insta::assert_snapshot!(err, @r###"The wheel filename "foo-1.2.3-tag-py3-none-any.whl" has an invalid build tag: must start with a digit"###);
+        let err = WheelFilename::from_str("foo-1.2.3-tag-py3-none-any-12345678.whl").unwrap_err();
+        insta::assert_snapshot!(err, @r###"The wheel filename "foo-1.2.3-tag-py3-none-any-12345678.whl" has an invalid build tag: must start with a digit"###);
     }
 
     #[test]
@@ -438,6 +481,20 @@ mod tests {
     fn ok_build_tag() {
         insta::assert_debug_snapshot!(WheelFilename::from_str(
             "foo-1.2.3-202206090410-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn ok_build_tag_and_variant_tag() {
+        insta::assert_debug_snapshot!(WheelFilename::from_str(
+            "foo-1.2.3-202206090410-py3-none-any-12345678.whl"
+        ));
+    }
+
+    #[test]
+    fn ok_variant_tag() {
+        insta::assert_debug_snapshot!(WheelFilename::from_str(
+            "foo-1.2.3-py3-none-any-12345678.whl"
         ));
     }
 

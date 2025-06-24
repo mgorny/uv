@@ -31,5 +31,6 @@ Ok(
                 repr: "202206090410-py3-none-any",
             },
         },
+        variant_tag: None,
     },
 )
